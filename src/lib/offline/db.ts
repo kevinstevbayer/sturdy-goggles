@@ -5,7 +5,7 @@ export interface OutboxItem {
   id: string;
   table: "attempts" | "station_resets";
   payload: Record<string, unknown>;
-  status: "queued" | "syncing" | "synced" | "failed";
+  status: "queued" | "syncing" | "synced" | "failed" | "conflict";
   attempts: number;
   next_retry_at: number;
   last_error: string | null;

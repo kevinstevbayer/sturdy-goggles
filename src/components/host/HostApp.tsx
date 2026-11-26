@@ -15,8 +15,15 @@ import {
 } from "lucide-react";
 import { clearSession, loadSession } from "@/lib/auth/session";
 import { t } from "@/lib/i18n";
-import { offlineDb } from "@/lib/offline/db";
-import { cacheStations, cacheTeams, enqueueWrite, flushOutbox } from "@/lib/offline/outbox";
+import { offlineDb, type OutboxItem } from "@/lib/offline/db";
+import {
+  cacheStations,
+  cacheTeams,
+  dismissConflict,
+  enqueueWrite,
+  flushOutbox,
+  getConflictItems
+} from "@/lib/offline/outbox";
 import { getRouteOrder } from "@/lib/reset";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import {
@@ -39,9 +46,33 @@ import { ResetPanel, type InboundTeamInfo } from "@/components/host/ResetPanel";
 
 type HostPhase = "scan" | "ready" | "running" | "result" | "bonus" | "review" | "reset";
 
+const ACTIVE_RUN_META_KEY = "active_host_run";
+
+interface ActiveHostRunSnapshot {
+  station_id: number;
+  session_id: string;
+  phase: Exclude<HostPhase, "scan" | "reset">;
+  selectedTeam: TeamPublic;
+  attemptId: string;
+  arrivedAtIso: string;
+  startedAtMs: number | null;
+  endedAtMs: number | null;
+  elapsedMs: number;
+  completed: boolean;
+  progress: number | null;
+  countValue: number;
+  counters: Record<string, number>;
+  bonusCorrect: boolean | null;
+  stampedVariant: string | null;
+  practiceMode: boolean;
+  wrongStationWarn: boolean;
+}
+
 function playBeep(freq = 880, durationMs = 140) {
   try {
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) return;
     const ctx = new AudioCtx();
     const osc = ctx.createOscillator();
@@ -79,6 +110,7 @@ export function HostApp() {
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   const [online, setOnline] = useState(true);
   const [pendingCount, setPendingCount] = useState(0);
+  const [conflicts, setConflicts] = useState<OutboxItem[]>([]);
   const [practiceMode, setPracticeMode] = useState(false);
 
   // Flow & QR scanner state
@@ -102,7 +134,8 @@ export function HostApp() {
   const [bonusCorrect, setBonusCorrect] = useState<boolean | null>(null);
   const [stampedVariant, setStampedVariant] = useState<string | null>(null);
 
-  // Widget overlays / hover state
+  // Widget overlays / hover state (timestamp-derived)
+  const [holdEndsAtMs, setHoldEndsAtMs] = useState<number | null>(null);
   const [holdRemainingMs, setHoldRemainingMs] = useState(0);
   const [hoverStartedAtMs, setHoverStartedAtMs] = useState<number | null>(null);
   const [hoverRemainingMs, setHoverRemainingMs] = useState(0);
@@ -110,6 +143,7 @@ export function HostApp() {
 
   // Reset Panel & Undo state
   const [lastSubmittedId, setLastSubmittedId] = useState<string | null>(null);
+  const lastSubmittedIdRef = useRef<string | null>(null);
   const [undoDeadlineMs, setUndoDeadlineMs] = useState<number | null>(null);
   const [undoSecondsLeft, setUndoSecondsLeft] = useState(0);
   const [lastAttemptSynced, setLastAttemptSynced] = useState(false);
@@ -121,6 +155,76 @@ export function HostApp() {
 
   const capFiredRef = useRef(false);
   const wakeLockRef = useRef<WakeLockController | null>(null);
+
+  useEffect(() => {
+    lastSubmittedIdRef.current = lastSubmittedId;
+  }, [lastSubmittedId]);
+
+  const refreshSyncCounters = useCallback(async (s: RoleSession) => {
+    const res = await flushOutbox(s);
+    setPendingCount(res.pendingCount);
+    setConflicts(await getConflictItems());
+    if (lastSubmittedIdRef.current) {
+      const ob = await offlineDb.outbox.get(lastSubmittedIdRef.current);
+      if (ob?.status === "synced") setLastAttemptSynced(true);
+    }
+  }, []);
+
+  // Persist active run snapshot in Dexie for crash / accidental reload recovery
+  useEffect(() => {
+    if (!session || !station) return;
+    if (
+      (phase === "ready" ||
+        phase === "running" ||
+        phase === "result" ||
+        phase === "bonus" ||
+        phase === "review") &&
+      selectedTeam &&
+      attemptId
+    ) {
+      const snap: ActiveHostRunSnapshot = {
+        station_id: station.id,
+        session_id: session.session_id,
+        phase,
+        selectedTeam,
+        attemptId,
+        arrivedAtIso: arrivedAtIso ?? new Date(serverAdjustedNow(clockOffsetMs)).toISOString(),
+        startedAtMs,
+        endedAtMs,
+        elapsedMs,
+        completed,
+        progress,
+        countValue,
+        counters,
+        bonusCorrect,
+        stampedVariant,
+        practiceMode,
+        wrongStationWarn
+      };
+      void offlineDb.meta.put({ key: ACTIVE_RUN_META_KEY, value: snap });
+    } else if (phase === "scan" || phase === "reset") {
+      void offlineDb.meta.delete(ACTIVE_RUN_META_KEY);
+    }
+  }, [
+    session,
+    station,
+    phase,
+    selectedTeam,
+    attemptId,
+    arrivedAtIso,
+    startedAtMs,
+    endedAtMs,
+    elapsedMs,
+    completed,
+    progress,
+    countValue,
+    counters,
+    bonusCorrect,
+    stampedVariant,
+    practiceMode,
+    wrongStationWarn,
+    clockOffsetMs
+  ]);
 
   // Acquire Wake Lock during running phase
   useEffect(() => {
@@ -137,7 +241,7 @@ export function HostApp() {
     };
   }, [phase]);
 
-  // Load session & bootstrap caches
+  // Load session, restore any interrupted attempt, & bootstrap caches (once on mount)
   useEffect(() => {
     const s = loadSession();
     if (!s || !s.station_id) {
@@ -155,6 +259,30 @@ export function HostApp() {
       if (cachedSt) setStation(cachedSt);
       const cachedTeams = await offlineDb.teams.toArray();
       if (cachedTeams.length > 0) setTeams(cachedTeams);
+
+      const savedRun = await offlineDb.meta.get(ACTIVE_RUN_META_KEY);
+      if (savedRun?.value) {
+        const snap = savedRun.value as ActiveHostRunSnapshot;
+        if (snap.station_id === s!.station_id && snap.session_id === s!.session_id) {
+          setSelectedTeam(snap.selectedTeam);
+          setAttemptId(snap.attemptId);
+          setArrivedAtIso(snap.arrivedAtIso);
+          setStartedAtMs(snap.startedAtMs);
+          setEndedAtMs(snap.endedAtMs);
+          setElapsedMs(snap.elapsedMs);
+          setCompleted(snap.completed);
+          setProgress(snap.progress);
+          setCountValue(snap.countValue);
+          setCounters(snap.counters);
+          setBonusCorrect(snap.bonusCorrect);
+          setStampedVariant(snap.stampedVariant);
+          setPracticeMode(snap.practiceMode);
+          setWrongStationWarn(snap.wrongStationWarn);
+          setPhase(snap.phase);
+        } else {
+          await offlineDb.meta.delete(ACTIVE_RUN_META_KEY);
+        }
+      }
 
       const [{ data: stData }, { data: tmData }, { data: setData }] = await Promise.all([
         supabase.from("stations").select("config").eq("id", s!.station_id!).maybeSingle(),
@@ -178,15 +306,14 @@ export function HostApp() {
         if (es.event_state === "live") setPracticeMode(false);
       }
 
-      const res = await flushOutbox(s!);
-      setPendingCount(res.pendingCount);
+      await refreshSyncCounters(s!);
     }
 
     void hydrate();
 
     const onOnline = () => {
       setOnline(true);
-      void flushOutbox(s).then((r) => setPendingCount(r.pendingCount));
+      void refreshSyncCounters(s);
     };
     const onOffline = () => setOnline(false);
     window.addEventListener("online", onOnline);
@@ -195,7 +322,11 @@ export function HostApp() {
     const pollId = window.setInterval(async () => {
       if (!navigator.onLine) return;
       const [{ data: sessRow }, { data: esRow }, { data: inbRows }] = await Promise.all([
-        supabase.from("role_sessions").select("revoked_at").eq("session_id", s.session_id).maybeSingle(),
+        supabase
+          .from("role_sessions")
+          .select("revoked_at")
+          .eq("session_id", s.session_id)
+          .maybeSingle(),
         supabase.from("event_settings").select("*").eq("id", 1).maybeSingle(),
         supabase.rpc("get_station_inbound")
       ]);
@@ -214,12 +345,7 @@ export function HostApp() {
       } else {
         setInboundTeam(null);
       }
-      const r = await flushOutbox(s);
-      setPendingCount(r.pendingCount);
-      if (lastSubmittedId) {
-        const ob = await offlineDb.outbox.get(lastSubmittedId);
-        if (ob?.status === "synced") setLastAttemptSynced(true);
-      }
+      await refreshSyncCounters(s);
     }, 5000);
 
     return () => {
@@ -227,7 +353,7 @@ export function HostApp() {
       window.removeEventListener("offline", onOffline);
       window.clearInterval(pollId);
     };
-  }, [router, lastSubmittedId]);
+  }, [router, refreshSyncCounters]);
 
   const capMs = (station?.cap_s ?? 120) * 1000;
   const hoverHoldMs = (station?.hover?.hold_s ?? 5) * 1000;
@@ -238,6 +364,7 @@ export function HostApp() {
       setEndedAtMs(nowAdj);
       setElapsedMs(finalTimeMs);
       setCompleted(didComplete);
+      setHoldEndsAtMs(null);
       setHoldRemainingMs(0);
       setHoverStartedAtMs(null);
       setHoverRemainingMs(0);
@@ -252,6 +379,11 @@ export function HostApp() {
         setProgress(null);
         setPhase(station?.bonus ? "bonus" : "review");
       } else {
+        if (station?.progress?.kind === "stepper") {
+          setProgress(station.progress.min);
+        } else {
+          setProgress(null);
+        }
         setPhase("result");
       }
     },
@@ -267,8 +399,12 @@ export function HostApp() {
       const nextElapsed = computeElapsedMs(startedAtMs, nowAdj, capMs);
       setElapsedMs(nextElapsed);
 
-      if (holdRemainingMs > 0) {
-        setHoldRemainingMs((prev) => Math.max(0, prev - 100));
+      if (holdEndsAtMs !== null) {
+        const rem = Math.max(0, holdEndsAtMs - nowAdj);
+        setHoldRemainingMs(rem);
+        if (rem <= 0) {
+          setHoldEndsAtMs(null);
+        }
       }
 
       if (nextElapsed >= capMs && !capFiredRef.current) {
@@ -298,6 +434,7 @@ export function HostApp() {
       }
     };
 
+    tick();
     const id = window.setInterval(tick, 100);
     const onVis = () => {
       if (document.visibilityState === "visible") tick();
@@ -307,7 +444,17 @@ export function HostApp() {
       window.clearInterval(id);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [phase, startedAtMs, clockOffsetMs, capMs, station, holdRemainingMs, hoverStartedAtMs, hoverHoldMs, finishRun]);
+  }, [
+    phase,
+    startedAtMs,
+    clockOffsetMs,
+    capMs,
+    station,
+    holdEndsAtMs,
+    hoverStartedAtMs,
+    hoverHoldMs,
+    finishRun
+  ]);
 
   // 60-second Undo countdown
   useEffect(() => {
@@ -336,13 +483,11 @@ export function HostApp() {
       setResetId(null);
       setResetStartedAtMs(null);
       setResetItemsDone(0);
-      const r = await flushOutbox(session);
-      setPendingCount(r.pendingCount);
+      await refreshSyncCounters(session);
     },
-    [session, station, resetId, resetStartedAtMs, clockOffsetMs, lastSubmittedId]
+    [session, station, resetId, resetStartedAtMs, clockOffsetMs, lastSubmittedId, refreshSyncCounters]
   );
 
-  // Unified team resolver (works from QR token OR manual team #, online OR offline)
   const resolveAndSelectTeam = useCallback(
     async (query: { token?: string; number?: number }) => {
       if (!session || !station) return;
@@ -365,13 +510,13 @@ export function HostApp() {
         return;
       }
 
-      // If currently in reset panel, scanning immediately closes reset and logs skipped=true
       if (phase === "reset" && resetId) {
         await recordResetLog(true, resetItemsDone);
       }
 
-      // Check already-played (Spec 2.2: hard-block)
-      if (!practiceMode) {
+      const isPractice = settings?.event_state === "live" ? false : practiceMode;
+
+      if (!isPractice) {
         const localExisting = await offlineDb.local_attempts
           .where("[team_id+station_id]")
           .equals([found.id, station.id])
@@ -398,19 +543,23 @@ export function HostApp() {
         }
       }
 
-      // Route validity check: warn if inbound doesn't match and station isn't route's first station
       const order = getRouteOrder(found.route);
       const isExpectedInbound = inboundTeam?.team_id === found.id;
       const isFirstOnRoute = order[0] === station.id;
-      setWrongStationWarn(!isExpectedInbound && !isFirstOnRoute && inboundTeam !== null);
+      const offRoute = !isExpectedInbound && !isFirstOnRoute && inboundTeam !== null;
+      setWrongStationWarn(offRoute);
 
       const newId = crypto.randomUUID();
       const nowIso = new Date(serverAdjustedNow(clockOffsetMs)).toISOString();
+      const variant = station.id === 7 ? (settings?.current_variant ?? "W1") : null;
+
       setCameraOpen(false);
       setSelectedTeam(found);
       setAttemptId(newId);
       setArrivedAtIso(nowIso);
-      setStampedVariant(station.id === 7 ? (settings?.current_variant ?? "W1") : null);
+      setStartedAtMs(null);
+      setEndedAtMs(null);
+      setStampedVariant(variant);
       setCounters({});
       setCountValue(0);
       setProgress(null);
@@ -418,8 +567,44 @@ export function HostApp() {
       setElapsedMs(0);
       setCompleted(false);
       setPhase("ready");
+
+      const arrivedRow: AttemptRow = {
+        id: newId,
+        team_id: found.id,
+        station_id: station.id,
+        state: "arrived",
+        arrived_at: nowIso,
+        started_at: null,
+        ended_at: null,
+        scored_at: null,
+        completed: null,
+        time_ms: null,
+        progress: null,
+        counters: {},
+        bonus_correct: null,
+        variant,
+        practice: isPractice,
+        voided: false,
+        version: 1,
+        session_id: session.session_id
+      };
+      await enqueueWrite("attempts", newId, arrivedRow as unknown as Record<string, unknown>);
+      await refreshSyncCounters(session);
     },
-    [session, station, teams, phase, resetId, recordResetLog, resetItemsDone, practiceMode, inboundTeam, clockOffsetMs, settings]
+    [
+      session,
+      station,
+      teams,
+      phase,
+      resetId,
+      recordResetLog,
+      resetItemsDone,
+      practiceMode,
+      inboundTeam,
+      clockOffsetMs,
+      settings,
+      refreshSyncCounters
+    ]
   );
 
   function handleLookupNumber() {
@@ -431,22 +616,64 @@ export function HostApp() {
     void resolveAndSelectTeam({ number: num });
   }
 
-  function handleStart() {
-    if (!station) return;
+  async function handleStart() {
+    if (!session || !station || !selectedTeam || !attemptId) return;
     playBeep(880, 120);
     vibrate(60);
     capFiredRef.current = false;
     const nowAdj = serverAdjustedNow(clockOffsetMs);
+    const startedIso = new Date(nowAdj).toISOString();
     setStartedAtMs(nowAdj);
     setElapsedMs(0);
     setHoverStartedAtMs(null);
+    setHoldEndsAtMs(null);
     setHoldRemainingMs(0);
     setPhase("running");
+
+    const isPractice = settings?.event_state === "live" ? false : practiceMode;
+    const startedRow: AttemptRow = {
+      id: attemptId,
+      team_id: selectedTeam.id,
+      station_id: station.id,
+      state: "started",
+      arrived_at: arrivedAtIso ?? startedIso,
+      started_at: startedIso,
+      ended_at: null,
+      scored_at: null,
+      completed: null,
+      time_ms: null,
+      progress: null,
+      counters: {},
+      bonus_correct: null,
+      variant: stampedVariant,
+      practice: isPractice,
+      voided: false,
+      version: 1,
+      session_id: session.session_id
+    };
+    await enqueueWrite("attempts", attemptId, startedRow as unknown as Record<string, unknown>);
+    await refreshSyncCounters(session);
   }
 
-  function handleCancelBeforeStart() {
+  async function handleCancelBeforeStart() {
+    if (session && attemptId) {
+      const ob = await offlineDb.outbox.get(attemptId);
+      if (ob && ob.status !== "synced") {
+        await offlineDb.outbox.delete(attemptId);
+        await offlineDb.local_attempts.delete(attemptId);
+      } else if (navigator.onLine) {
+        const supabase = getSupabaseClient(session);
+        await supabase.rpc("host_cancel_before_start", { p_attempt_id: attemptId });
+        await offlineDb.local_attempts.update(attemptId, { voided: true });
+      }
+      await offlineDb.meta.delete(ACTIVE_RUN_META_KEY);
+      const pending = await offlineDb.outbox.where("status").anyOf("queued", "failed", "syncing").count();
+      setPendingCount(pending);
+    }
+
     setSelectedTeam(null);
     setAttemptId(null);
+    setArrivedAtIso(null);
     setTeamInput("");
     setPhase("scan");
   }
@@ -466,7 +693,7 @@ export function HostApp() {
       scored_at: null,
       completed,
       time_ms: elapsedMs,
-      progress,
+      progress: station.widget === "counter_countdown" ? countValue : progress,
       counters,
       bonus_correct: station.bonus ? bonusCorrect : null,
       variant: stampedVariant,
@@ -477,13 +704,13 @@ export function HostApp() {
     };
 
     await enqueueWrite("attempts", attemptId, payload as unknown as Record<string, unknown>);
+    await offlineDb.meta.delete(ACTIVE_RUN_META_KEY);
     setLastSubmittedId(attemptId);
     setLastAttemptSynced(false);
     setUndoError(null);
     setUndoDeadlineMs(Date.now() + 60_000);
     setUndoSecondsLeft(60);
 
-    // Immediately enter Between-Team Reset Panel
     setResetId(crypto.randomUUID());
     setResetStartedAtMs(finalEndMs);
     setResetItemsDone(0);
@@ -491,27 +718,40 @@ export function HostApp() {
     setLookupError(null);
     setPhase("reset");
 
-    const res = await flushOutbox(session);
-    setPendingCount(res.pendingCount);
-    const ob = await offlineDb.outbox.get(attemptId);
-    if (ob?.status === "synced") setLastAttemptSynced(true);
+    await refreshSyncCounters(session);
   }
 
+  // P1 #7: Offline-safe Host Undo
+  // If the attempt has not yet synced to Postgres, cancel it directly from Dexie outbox.
   async function handleUndo() {
     if (!session || !lastSubmittedId) return;
     setUndoError(null);
-    const supabase = getSupabaseClient(session);
-    const { error } = await supabase.rpc("host_undo", {
-      p_attempt_id: lastSubmittedId,
-      p_undone_at: new Date(serverAdjustedNow(clockOffsetMs)).toISOString()
-    });
 
-    if (error) {
-      setUndoError(error.message);
-      return;
+    const ob = await offlineDb.outbox.get(lastSubmittedId);
+    if (ob && ob.status !== "synced") {
+      await offlineDb.outbox.delete(lastSubmittedId);
+      await offlineDb.local_attempts.delete(lastSubmittedId);
+      const pending = await offlineDb.outbox.where("status").anyOf("queued", "failed", "syncing").count();
+      setPendingCount(pending);
+      setConflicts(await getConflictItems());
+    } else {
+      if (!navigator.onLine) {
+        setUndoError("Offline: reconnect to undo synced attempt");
+        return;
+      }
+      const supabase = getSupabaseClient(session);
+      const { error } = await supabase.rpc("host_undo", {
+        p_attempt_id: lastSubmittedId,
+        p_undone_at: new Date(serverAdjustedNow(clockOffsetMs)).toISOString()
+      });
+
+      if (error) {
+        setUndoError(error.message);
+        return;
+      }
+      await offlineDb.local_attempts.update(lastSubmittedId, { voided: true });
     }
 
-    await offlineDb.local_attempts.update(lastSubmittedId, { voided: true });
     setAttemptId(crypto.randomUUID());
     setLastSubmittedId(null);
     setUndoDeadlineMs(null);
@@ -538,6 +778,7 @@ export function HostApp() {
   }, [phase, capFlash, remainingMs]);
 
   const notEnoughHoverTime = remainingMs < hoverHoldMs;
+  const canGoBackFromReview = Boolean(station?.bonus) || (!completed && Boolean(station?.progress));
 
   if (!session) return null;
 
@@ -563,7 +804,11 @@ export function HostApp() {
             }
           >
             {online ? <Wifi className="w-3.5 h-3.5" /> : <CloudOff className="w-3.5 h-3.5" />}
-            {online ? (pendingCount > 0 ? pendingCount + " " + t("common.queued") : t("common.synced")) : t("common.offline")}
+            {online
+              ? pendingCount > 0
+                ? pendingCount + " " + t("common.queued")
+                : t("common.synced")
+              : t("common.offline")}
           </span>
           {settings?.event_state !== "live" && (phase === "scan" || phase === "reset") && (
             <button
@@ -592,6 +837,29 @@ export function HostApp() {
         </div>
       </header>
 
+      {/* Non-retriable outbox conflict banner */}
+      {conflicts.length > 0 && (
+        <div className="bg-danger/15 border-b border-danger/40 px-4 py-2.5 text-xs text-danger space-y-1.5">
+          {conflicts.map((c) => (
+            <div key={c.id} className="flex items-center justify-between gap-2">
+              <span className="font-medium truncate">
+                Sync rejected ({c.table}): {c.last_error ?? "Conflict"}
+              </span>
+              <button
+                type="button"
+                onClick={async () => {
+                  await dismissConflict(c.id);
+                  setConflicts(await getConflictItems());
+                }}
+                className="px-2 py-1 rounded border border-danger/50 font-semibold shrink-0"
+              >
+                Dismiss
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Main zone */}
       <main className="flex-1 p-4 flex flex-col justify-between max-w-md w-full mx-auto gap-4">
         {!station ? (
@@ -614,7 +882,6 @@ export function HostApp() {
               />
             )}
 
-            {/* Scan / manual lookup is ALWAYS available (never blocked by reset panel) */}
             {cameraOpen ? (
               <QrScanner
                 compact={phase === "reset"}
@@ -688,14 +955,14 @@ export function HostApp() {
             <div className="safe-pb grid grid-cols-3 gap-3">
               <button
                 type="button"
-                onClick={handleCancelBeforeStart}
+                onClick={() => void handleCancelBeforeStart()}
                 className="h-14 rounded-card border border-border bg-surface text-text font-semibold"
               >
                 {t("common.cancel")}
               </button>
               <button
                 type="button"
-                onClick={handleStart}
+                onClick={() => void handleStart()}
                 className="col-span-2 h-14 rounded-card bg-success text-white font-semibold flex items-center justify-center gap-2"
               >
                 <Play className="w-5 h-5" />
@@ -747,7 +1014,10 @@ export function HostApp() {
                       key={h.id}
                       type="button"
                       onClick={() => {
-                        setHoldRemainingMs((h.hold_s ?? 3) * 1000);
+                        const durMs = (h.hold_s ?? 3) * 1000;
+                        const nowAdj = serverAdjustedNow(clockOffsetMs);
+                        setHoldEndsAtMs(nowAdj + durMs);
+                        setHoldRemainingMs(durMs);
                         setCounters((c) => ({ ...c, [h.id]: (c[h.id] ?? 0) + 1 }));
                       }}
                       className="w-full h-14 rounded-card border border-warning bg-warning/15 text-warning font-semibold"
@@ -862,7 +1132,8 @@ export function HostApp() {
                       setProgress((p) =>
                         Math.max(
                           station.progress!.kind === "stepper" ? station.progress!.min : 0,
-                          (p ?? 0) - (station.progress!.kind === "stepper" ? station.progress!.step : 5)
+                          (p ?? 0) -
+                            (station.progress!.kind === "stepper" ? station.progress!.step : 5)
                         )
                       )
                     }
@@ -871,7 +1142,7 @@ export function HostApp() {
                     -
                   </button>
                   <span className="text-3xl font-bold tabular-nums">
-                    {progress ?? 0} {station.progress.unit}
+                    {progress ?? station.progress.min} {station.progress.unit}
                   </span>
                   <button
                     type="button"
@@ -879,7 +1150,8 @@ export function HostApp() {
                       setProgress((p) =>
                         Math.min(
                           station.progress!.kind === "stepper" ? station.progress!.max : 150,
-                          (p ?? 0) + (station.progress!.kind === "stepper" ? station.progress!.step : 5)
+                          (p ?? 0) +
+                            (station.progress!.kind === "stepper" ? station.progress!.step : 5)
                         )
                       )
                     }
@@ -948,18 +1220,59 @@ export function HostApp() {
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-muted">Outcome</span>
-                  <span className="font-semibold">{completed ? t("host.completed") : t("host.dnf")}</span>
+                  <span className="font-semibold">
+                    {completed ? t("host.completed") : t("host.dnf")}
+                  </span>
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-muted">Time</span>
                   <span className="font-semibold tabular-nums">{formatDurationMs(elapsedMs)}</span>
                 </div>
-                {progress !== null && (
-                  <div className="flex justify-between text-sm">
-                    <span className="text-muted">Progress</span>
-                    <span className="font-semibold tabular-nums">{progress}</span>
+
+                {station.widget === "counter_countdown" ? (
+                  <div className="flex items-center justify-between pt-2 border-t border-border">
+                    <span className="text-sm text-muted">Count</span>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCountValue((v) => {
+                            const next = Math.max(0, v - 1);
+                            setProgress(next);
+                            return next;
+                          });
+                        }}
+                        className="h-10 w-12 rounded-card border border-border font-bold"
+                      >
+                        -1
+                      </button>
+                      <span className="text-lg font-bold tabular-nums min-w-[2ch] text-center">
+                        {countValue}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCountValue((v) => {
+                            const next = v + 1;
+                            setProgress(next);
+                            return next;
+                          });
+                        }}
+                        className="h-10 w-12 rounded-card border border-border font-bold"
+                      >
+                        +1
+                      </button>
+                    </div>
                   </div>
+                ) : (
+                  progress !== null && (
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted">Progress</span>
+                      <span className="font-semibold tabular-nums">{progress}</span>
+                    </div>
+                  )
                 )}
+
                 {station.bonus && (
                   <div className="flex justify-between text-sm">
                     <span className="text-muted">Bonus</span>
@@ -969,18 +1282,23 @@ export function HostApp() {
                   </div>
                 )}
               </div>
-              <div className="safe-pb grid grid-cols-3 gap-3">
+              <div className={"safe-pb grid gap-3 " + (canGoBackFromReview ? "grid-cols-3" : "grid-cols-1")}>
+                {canGoBackFromReview && (
+                  <button
+                    type="button"
+                    onClick={() => setPhase(station.bonus ? "bonus" : "result")}
+                    className="h-14 rounded-card border border-border bg-surface font-semibold"
+                  >
+                    {t("common.back")}
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={() => setPhase(station.bonus ? "bonus" : "result")}
-                  className="h-14 rounded-card border border-border bg-surface font-semibold"
-                >
-                  {t("common.back")}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSubmitAttempt}
-                  className="col-span-2 h-14 rounded-card bg-accent text-white font-semibold"
+                  onClick={() => void handleSubmitAttempt()}
+                  className={
+                    "h-14 rounded-card bg-accent text-white font-semibold " +
+                    (canGoBackFromReview ? "col-span-2" : "w-full")
+                  }
                 >
                   {t("common.submit")}
                 </button>

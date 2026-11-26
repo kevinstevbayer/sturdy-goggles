@@ -52,12 +52,12 @@ describe("reset stats, station state & route order", () => {
         lastScoredEndedAtMs: base,
         lastResetDoneAtMs: null,
         lastResetSkipped: false,
+        lastResetStartedAtMs: null,
         targetResetS: 60,
         nowMs: base + 30_000
       })
     ).toBe("resetting");
 
-    // Ready after target_s even if Reset done was not tapped
     expect(
       deriveStationState({
         hasActiveSession: true,
@@ -65,12 +65,12 @@ describe("reset stats, station state & route order", () => {
         lastScoredEndedAtMs: base,
         lastResetDoneAtMs: null,
         lastResetSkipped: false,
+        lastResetStartedAtMs: null,
         targetResetS: 60,
         nowMs: base + 61_000
       })
     ).toBe("ready");
 
-    // Ready immediately when Reset done tapped
     expect(
       deriveStationState({
         hasActiveSession: true,
@@ -78,8 +78,42 @@ describe("reset stats, station state & route order", () => {
         lastScoredEndedAtMs: base,
         lastResetDoneAtMs: base + 20_000,
         lastResetSkipped: false,
+        lastResetStartedAtMs: base,
         targetResetS: 60,
         nowMs: base + 25_000
+      })
+    ).toBe("ready");
+  });
+
+  it("does NOT mark station ready if lastResetSkipped belonged to an earlier attempt", () => {
+    const attempt1End = 1_000_000;
+    const attempt2End = 1_200_000;
+
+    // Prior reset was skipped at attempt1End, now attempt2 just ended 15s ago -> must be resetting
+    expect(
+      deriveStationState({
+        hasActiveSession: true,
+        hasInPlayAttempt: false,
+        lastScoredEndedAtMs: attempt2End,
+        lastResetDoneAtMs: null,
+        lastResetSkipped: true,
+        lastResetStartedAtMs: attempt1End,
+        targetResetS: 60,
+        nowMs: attempt2End + 15_000
+      })
+    ).toBe("resetting");
+
+    // Once a skipped reset is recorded for attempt2 (>= attempt2End) -> ready
+    expect(
+      deriveStationState({
+        hasActiveSession: true,
+        hasInPlayAttempt: false,
+        lastScoredEndedAtMs: attempt2End,
+        lastResetDoneAtMs: null,
+        lastResetSkipped: true,
+        lastResetStartedAtMs: attempt2End,
+        targetResetS: 60,
+        nowMs: attempt2End + 15_000
       })
     ).toBe("ready");
   });

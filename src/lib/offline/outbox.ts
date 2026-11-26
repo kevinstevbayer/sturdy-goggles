@@ -9,6 +9,44 @@ export function nextBackoffMs(retryCount: number): number {
   return BACKOFF_MS[idx] ?? 30000;
 }
 
+/**
+ * Classifies permanent Postgres / PostgREST constraint or permission failures so
+ * they stop retrying indefinitely and surface as a visible conflict instead.
+ */
+export function isNonRetriableError(error: {
+  code?: string | null;
+  message?: string | null;
+  status?: number | null;
+}): boolean {
+  const code = String(error.code ?? "");
+  const msg = String(error.message ?? "");
+  const status = error.status ?? 0;
+
+  if (
+    code === "23505" || // unique_violation (e.g. uq_attempts_live_team_station)
+    code === "23503" || // foreign_key_violation
+    code === "23514" || // check_violation
+    code === "P0001" || // raise_exception (e.g. PRACTICE_FORBIDDEN_IN_LIVE_MODE)
+    code === "42501" // insufficient_privilege / RLS
+  ) {
+    return true;
+  }
+
+  if (
+    msg.includes("uq_attempts_live_team_station") ||
+    msg.includes("PRACTICE_FORBIDDEN_IN_LIVE_MODE") ||
+    msg.includes("row-level security")
+  ) {
+    return true;
+  }
+
+  if (status === 400 || status === 401 || status === 403 || status === 409) {
+    return true;
+  }
+
+  return false;
+}
+
 export async function cacheTeams(teams: TeamPublic[]): Promise<void> {
   await offlineDb.transaction("rw", offlineDb.teams, async () => {
     await offlineDb.teams.clear();
@@ -42,13 +80,27 @@ export async function enqueueWrite(
   }
 }
 
+export async function getConflictItems(): Promise<OutboxItem[]> {
+  return await offlineDb.outbox.where("status").equals("conflict").toArray();
+}
+
+export async function dismissConflict(id: string): Promise<void> {
+  const item = await offlineDb.outbox.get(id);
+  await offlineDb.outbox.delete(id);
+  if (item?.table === "attempts") {
+    await offlineDb.local_attempts.delete(id);
+  }
+}
+
 export async function flushOutbox(session: RoleSession): Promise<{
   syncedCount: number;
   pendingCount: number;
+  conflictCount: number;
 }> {
   if (typeof navigator !== "undefined" && !navigator.onLine) {
-    const pending = await offlineDb.outbox.where("status").notEqual("synced").count();
-    return { syncedCount: 0, pendingCount: pending };
+    const pending = await offlineDb.outbox.where("status").anyOf("queued", "failed", "syncing").count();
+    const conflictCount = await offlineDb.outbox.where("status").equals("conflict").count();
+    return { syncedCount: 0, pendingCount: pending, conflictCount };
   }
 
   const supabase = getSupabaseClient(session);
@@ -63,7 +115,7 @@ export async function flushOutbox(session: RoleSession): Promise<{
 
   for (const item of due) {
     await offlineDb.outbox.update(item.id, { status: "syncing" });
-    const { error } = await supabase
+    const { error, status } = await supabase
       .from(item.table)
       .upsert(item.payload, { onConflict: "id" });
 
@@ -73,6 +125,11 @@ export async function flushOutbox(session: RoleSession): Promise<{
         last_error: null
       });
       syncedCount += 1;
+    } else if (isNonRetriableError({ code: error.code, message: error.message, status })) {
+      await offlineDb.outbox.update(item.id, {
+        status: "conflict",
+        last_error: error.message
+      });
     } else {
       const nextRetry = item.attempts + 1;
       await offlineDb.outbox.update(item.id, {
@@ -84,6 +141,7 @@ export async function flushOutbox(session: RoleSession): Promise<{
     }
   }
 
-  const pendingCount = await offlineDb.outbox.where("status").notEqual("synced").count();
-  return { syncedCount, pendingCount };
+  const pendingCount = await offlineDb.outbox.where("status").anyOf("queued", "failed", "syncing").count();
+  const conflictCount = await offlineDb.outbox.where("status").equals("conflict").count();
+  return { syncedCount, pendingCount, conflictCount };
 }

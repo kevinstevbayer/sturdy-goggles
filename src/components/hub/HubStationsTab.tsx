@@ -69,7 +69,9 @@ export function HubStationsTab({
             scored.length > 0
               ? Math.max(...scored.map((a) => Date.parse(a.ended_at!)))
               : null;
-          const stResets = resets.filter((r) => r.station_id === st.id);
+          const stResets = resets
+            .filter((r) => r.station_id === st.id)
+            .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
           const lastReset = stResets[0] ?? null;
 
           const state = deriveStationState({
@@ -78,6 +80,7 @@ export function HubStationsTab({
             lastScoredEndedAtMs: lastEnded,
             lastResetDoneAtMs: lastReset?.done_at ? Date.parse(lastReset.done_at) : null,
             lastResetSkipped: lastReset?.skipped ?? false,
+            lastResetStartedAtMs: lastReset?.started_at ? Date.parse(lastReset.started_at) : null,
             targetResetS: st.reset.target_s,
             nowMs
           });

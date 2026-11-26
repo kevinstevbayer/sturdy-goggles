@@ -18,6 +18,8 @@ import {
   Flag,
   KeyRound,
   LogOut,
+  Menu,
+  Plus,
   Printer,
   Radio,
   Settings,
@@ -67,6 +69,7 @@ export function HubApp() {
   const router = useRouter();
   const [session, setSession] = useState<RoleSession | null>(null);
   const [tab, setTab] = useState<HubTab>("leaderboard");
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
 
   const [teams, setTeams] = useState<TeamRow[]>([]);
   const [stations, setStations] = useState<StationConfig[]>([]);
@@ -84,17 +87,29 @@ export function HubApp() {
   const [drawerTeamId, setDrawerTeamId] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
+  // Team creation & withdraw modal state
   const [newNumber, setNewNumber] = useState("");
   const [newChurch, setNewChurch] = useState("");
   const [newTeamName, setNewTeamName] = useState("");
   const [formMsg, setFormMsg] = useState<string | null>(null);
   const [hubScanMode, setHubScanMode] = useState<"launch" | "finish" | null>(null);
+  const [withdrawTarget, setWithdrawTarget] = useState<TeamRow | null>(null);
+  const [withdrawReason, setWithdrawReason] = useState("");
 
+  // Attempt edit modal state (now includes completed & progress)
   const [editingAttempt, setEditingAttempt] = useState<AttemptRow | null>(null);
   const [editReason, setEditReason] = useState("");
   const [editVoided, setEditVoided] = useState(false);
+  const [editCompleted, setEditCompleted] = useState<boolean>(true);
+  const [editProgress, setEditProgress] = useState("");
   const [editBonus, setEditBonus] = useState<string>("null");
   const [editTimeMs, setEditTimeMs] = useState("");
+
+  // Settings form state (Station 7 variant labels, max_teams, walk_time_s)
+  const [newVariantLabel, setNewVariantLabel] = useState("");
+  const [maxTeamsInput, setMaxTeamsInput] = useState("30");
+  const [walkTimeInput, setWalkTimeInput] = useState("30");
+  const [settingsSavedMsg, setSettingsSavedMsg] = useState<string | null>(null);
 
   const loadAll = async (s: RoleSession) => {
     const supabase = getSupabaseClient(s);
@@ -102,8 +117,15 @@ export function HubApp() {
       supabase.from("teams").select("*").order("number", { ascending: true }),
       supabase.from("stations").select("config").order("id", { ascending: true }),
       supabase.from("attempts").select("*").order("updated_at", { ascending: false }),
-      supabase.from("station_resets").select("id,station_id,started_at,done_at,items_done,skipped").order("started_at", { ascending: false }),
-      supabase.from("role_sessions").select("station_id").is("revoked_at", null).not("station_id", "is", null),
+      supabase
+        .from("station_resets")
+        .select("id,station_id,started_at,done_at,items_done,skipped")
+        .order("started_at", { ascending: false }),
+      supabase
+        .from("role_sessions")
+        .select("station_id")
+        .is("revoked_at", null)
+        .not("station_id", "is", null),
       supabase.from("event_settings").select("*").eq("id", 1).maybeSingle(),
       supabase.from("audit_log").select("*").order("ts", { ascending: false }).limit(50)
     ]);
@@ -115,7 +137,12 @@ export function HubApp() {
     if (sessRes.data) {
       setActiveStationIds(new Set(sessRes.data.map((r) => Number(r.station_id))));
     }
-    if (setRes.data) setSettings(setRes.data as EventSettingsRow);
+    if (setRes.data) {
+      const es = setRes.data as EventSettingsRow;
+      setSettings(es);
+      setMaxTeamsInput(String(es.max_teams));
+      setWalkTimeInput(String(es.walk_time_s));
+    }
     if (audRes.data) setAuditLog(audRes.data as AuditLogRow[]);
   };
 
@@ -228,6 +255,11 @@ export function HubApp() {
           <div className="flex items-center gap-2">
             <span className="font-semibold tabular-nums">#{row.original.team_number}</span>
             <span className="text-muted truncate max-w-[140px]">{row.original.church}</span>
+            {row.original.duel_won && (
+              <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent text-[11px] font-semibold">
+                DUEL
+              </span>
+            )}
             {row.original.missing_finish_alert && (
               <span className="px-1.5 py-0.5 rounded bg-warning/15 text-warning text-[11px] font-semibold">
                 {t("hub.missing_finish")}
@@ -309,6 +341,27 @@ export function HubApp() {
     await loadAll(session);
   }
 
+  async function handleToggleDuelWon(team: TeamRow) {
+    if (!session) return;
+    const supabase = getSupabaseClient(session);
+    await supabase.from("teams").update({ duel_won: !team.duel_won }).eq("id", team.id);
+    await loadAll(session);
+  }
+
+  async function handleConfirmWithdraw(e: FormEvent) {
+    e.preventDefault();
+    if (!session || !withdrawTarget || !withdrawReason.trim()) return;
+    const supabase = getSupabaseClient(session);
+    await supabase.rpc("hub_set_team_withdrawn", {
+      p_team_id: withdrawTarget.id,
+      p_withdrawn: !withdrawTarget.withdrawn,
+      p_reason: withdrawReason.trim()
+    });
+    setWithdrawTarget(null);
+    setWithdrawReason("");
+    await loadAll(session);
+  }
+
   async function handleHubQrScan(token: string) {
     if (!session || !hubScanMode) return;
     const found = teams.find((tm) => tm.token.toUpperCase() === token.trim().toUpperCase());
@@ -326,7 +379,9 @@ export function HubApp() {
     const supabase = getSupabaseClient(session);
     const patch: Record<string, unknown> = {
       voided: editVoided,
-      bonus_correct: editBonus === "null" ? null : editBonus === "true"
+      completed: editCompleted,
+      bonus_correct: editBonus === "null" ? null : editBonus === "true",
+      progress: editProgress.trim() === "" ? null : Number(editProgress)
     };
     if (editTimeMs.trim() !== "") {
       patch.time_ms = Number.parseInt(editTimeMs, 10);
@@ -343,12 +398,39 @@ export function HubApp() {
 
   async function handleSettingPatch(patch: Record<string, unknown>, reason: string) {
     if (!session) return;
+    setSettingsSavedMsg(null);
     const supabase = getSupabaseClient(session);
-    await supabase.rpc("hub_update_event_settings", {
+    const { error } = await supabase.rpc("hub_update_event_settings", {
       p_patch: patch,
       p_reason: reason
     });
-    await loadAll(session);
+    if (!error) {
+      setSettingsSavedMsg(t("hub.settings_saved"));
+      await loadAll(session);
+    }
+  }
+
+  async function handleAddVariantLabel(e: FormEvent) {
+    e.preventDefault();
+    if (!settings) return;
+    const clean = newVariantLabel.trim().slice(0, 12);
+    if (!clean || settings.variant_labels.includes(clean)) return;
+    const nextLabels = [...settings.variant_labels, clean];
+    await handleSettingPatch(
+      { variant_labels: nextLabels, current_variant: clean },
+      "hub_add_variant_label"
+    );
+    setNewVariantLabel("");
+  }
+
+  async function handleSaveNumericSettings(e: FormEvent) {
+    e.preventDefault();
+    const maxTeams = Math.min(200, Math.max(1, Number.parseInt(maxTeamsInput, 10) || 30));
+    const walkTime = Math.min(300, Math.max(0, Number.parseInt(walkTimeInput, 10) || 30));
+    await handleSettingPatch(
+      { max_teams: maxTeams, walk_time_s: walkTime },
+      "hub_update_capacity_and_walk_time"
+    );
   }
 
   const drawerTeam = teams.find((tm) => tm.id === drawerTeamId) ?? null;
@@ -365,17 +447,24 @@ export function HubApp() {
     { id: "export", label: t("hub.tab_export"), icon: Download }
   ];
 
+  const primaryMobileTabs = navItems.slice(0, 4);
+  const overflowMobileTabs = navItems.slice(4);
+  const isOverflowTabActive = overflowMobileTabs.some((item) => item.id === tab);
+
   if (!session) return null;
 
   return (
     <div className="min-h-[100dvh] flex flex-col lg:flex-row bg-bg">
+      {/* Desktop sidebar */}
       <aside className="hidden lg:flex lg:w-56 flex-col border-r border-border bg-surface p-3 gap-1 shrink-0">
         <div className="px-3 py-2 flex items-center justify-between">
           <span className="font-semibold text-sm">{t("app.title")} · Hub</span>
           <span
             className={
               "px-2 py-0.5 rounded text-[11px] font-semibold " +
-              (settings?.event_state === "live" ? "bg-success/15 text-success" : "bg-warning/15 text-warning")
+              (settings?.event_state === "live"
+                ? "bg-success/15 text-success"
+                : "bg-warning/15 text-warning")
             }
           >
             {settings?.event_state?.toUpperCase() ?? "PRACTICE"}
@@ -452,7 +541,9 @@ export function HubApp() {
                 <AlertTriangle className="w-4 h-4 shrink-0" />
                 <span>
                   {t("hub.variant_warning")}:{" "}
-                  {scoring.variant_warnings.map((w) => w.variant + " (" + w.attempt_count + ")").join(", ")}
+                  {scoring.variant_warnings
+                    .map((w) => w.variant + " (" + w.attempt_count + ")")
+                    .join(", ")}
                 </span>
               </div>
             )}
@@ -487,7 +578,9 @@ export function HubApp() {
                           setSelectedIndex(idx);
                           setDrawerTeamId(row.original.team_id);
                         }}
-                        className={"cursor-pointer hover:bg-bg " + (idx === selectedIndex ? "bg-accent/5" : "")}
+                        className={
+                          "cursor-pointer hover:bg-bg " + (idx === selectedIndex ? "bg-accent/5" : "")
+                        }
                       >
                         {row.getVisibleCells().map((cell) => (
                           <td key={cell.id} className="px-3 py-2.5 whitespace-nowrap">
@@ -601,14 +694,19 @@ export function HubApp() {
                       <span className="text-muted text-xs">
                         (Route {String.fromCharCode(65 + (tm.route % 7))} · {tm.token})
                       </span>
+                      {tm.duel_won && (
+                        <span className="ml-2 px-1.5 py-0.5 rounded bg-accent/15 text-accent text-xs font-semibold">
+                          Duel won
+                        </span>
+                      )}
                       {tm.withdrawn && (
                         <span className="ml-2 px-1.5 py-0.5 rounded bg-danger/15 text-danger text-xs">
                           Withdrawn
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-2">
-                      {!tm.checked_in_at && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      {!tm.checked_in_at && !tm.withdrawn && (
                         <button
                           type="button"
                           onClick={() => updateTeamTimestamp(tm.id, "checked_in_at")}
@@ -617,7 +715,7 @@ export function HubApp() {
                           {t("hub.check_in")}
                         </button>
                       )}
-                      {!tm.started_at && (
+                      {!tm.started_at && !tm.withdrawn && (
                         <button
                           type="button"
                           onClick={() => updateTeamTimestamp(tm.id, "started_at")}
@@ -626,7 +724,7 @@ export function HubApp() {
                           {t("hub.launch")}
                         </button>
                       )}
-                      {tm.started_at && !tm.finished_at && (
+                      {tm.started_at && !tm.finished_at && !tm.withdrawn && (
                         <button
                           type="button"
                           onClick={() => updateTeamTimestamp(tm.id, "finished_at")}
@@ -635,6 +733,33 @@ export function HubApp() {
                           {t("hub.finish")}
                         </button>
                       )}
+                      <button
+                        type="button"
+                        onClick={() => void handleToggleDuelWon(tm)}
+                        className={
+                          "h-9 px-3 rounded-card border text-xs font-medium " +
+                          (tm.duel_won
+                            ? "border-accent bg-accent/15 text-accent"
+                            : "border-border text-muted")
+                        }
+                      >
+                        {tm.duel_won ? "Duel: Won" : "Duel: No"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWithdrawTarget(tm);
+                          setWithdrawReason("");
+                        }}
+                        className={
+                          "h-9 px-3 rounded-card border text-xs font-medium " +
+                          (tm.withdrawn
+                            ? "border-success/40 text-success"
+                            : "border-danger/40 text-danger")
+                        }
+                      >
+                        {tm.withdrawn ? "Reinstate" : t("hub.withdraw")}
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -665,20 +790,30 @@ export function HubApp() {
               </p>
             ) : (
               <div className="bg-surface border border-border rounded-card shadow-soft divide-y divide-border">
-                {attempts.slice(0, 40).map((att) => {
+                {attempts.slice(0, 60).map((att) => {
                   const tm = teams.find((x) => x.id === att.team_id);
                   return (
                     <div key={att.id} className="p-3 flex items-center justify-between gap-2 text-sm">
                       <div className="tabular-nums">
-                        <span className="font-semibold">Team #{tm?.number ?? "?"}</span> · Stn {att.station_id} ·{" "}
-                        {att.time_ms !== null ? formatDurationMs(att.time_ms) : "—"} ·{" "}
-                        {att.voided ? "VOID" : att.completed ? t("host.completed") : t("host.dnf")}
+                        <span className="font-semibold">Team #{tm?.number ?? "?"}</span> · Stn{" "}
+                        {att.station_id} ·{" "}
+                        {att.time_ms !== null ? formatDurationMs(att.time_ms) : "—"}
+                        {att.progress !== null ? " · Prog " + att.progress : ""} ·{" "}
+                        {att.voided
+                          ? "VOID"
+                          : att.state !== "scored"
+                            ? att.state.toUpperCase()
+                            : att.completed
+                              ? t("host.completed")
+                              : t("host.dnf")}
                       </div>
                       <button
                         type="button"
                         onClick={() => {
                           setEditingAttempt(att);
                           setEditVoided(att.voided);
+                          setEditCompleted(att.completed === true);
+                          setEditProgress(att.progress !== null ? String(att.progress) : "");
                           setEditBonus(att.bonus_correct === null ? "null" : String(att.bonus_correct));
                           setEditTimeMs(att.time_ms !== null ? String(att.time_ms) : "");
                           setEditReason("");
@@ -716,8 +851,14 @@ export function HubApp() {
         )}
 
         {tab === "settings" && settings && (
-          <div className="p-4 lg:p-6 space-y-4 max-w-xl">
-            <h1 className="text-lg font-semibold">{t("hub.tab_settings")}</h1>
+          <div className="p-4 lg:p-6 space-y-5 max-w-xl">
+            <div className="flex items-center justify-between">
+              <h1 className="text-lg font-semibold">{t("hub.tab_settings")}</h1>
+              {settingsSavedMsg && (
+                <span className="text-xs font-semibold text-success">{settingsSavedMsg}</span>
+              )}
+            </div>
+
             <div className="bg-surface border border-border rounded-card p-5 shadow-soft space-y-4 text-sm">
               <div className="flex items-center justify-between">
                 <span className="font-medium">{t("hub.event_state")}</span>
@@ -729,7 +870,9 @@ export function HubApp() {
                       onClick={() => handleSettingPatch({ event_state: st }, "hub_toggle_event_state")}
                       className={
                         "h-9 px-3 rounded-card border text-xs font-semibold " +
-                        (settings.event_state === st ? "bg-accent text-white border-accent" : "border-border")
+                        (settings.event_state === st
+                          ? "bg-accent text-white border-accent"
+                          : "border-border")
                       }
                     >
                       {st.toUpperCase()}
@@ -748,7 +891,9 @@ export function HubApp() {
                       onClick={() => handleSettingPatch({ scoring_n_mode: mode }, "hub_toggle_n_mode")}
                       className={
                         "h-9 px-3 rounded-card border text-xs font-semibold " +
-                        (settings.scoring_n_mode === mode ? "bg-accent text-white border-accent" : "border-border")
+                        (settings.scoring_n_mode === mode
+                          ? "bg-accent text-white border-accent"
+                          : "border-border")
                       }
                     >
                       {mode.toUpperCase()}
@@ -764,10 +909,14 @@ export function HubApp() {
                     <button
                       key={mode}
                       type="button"
-                      onClick={() => handleSettingPatch({ variant_ranking_mode: mode }, "hub_toggle_variant_mode")}
+                      onClick={() =>
+                        handleSettingPatch({ variant_ranking_mode: mode }, "hub_toggle_variant_mode")
+                      }
                       className={
                         "h-9 px-3 rounded-card border text-xs font-semibold " +
-                        (settings.variant_ranking_mode === mode ? "bg-accent text-white border-accent" : "border-border")
+                        (settings.variant_ranking_mode === mode
+                          ? "bg-accent text-white border-accent"
+                          : "border-border")
                       }
                     >
                       {mode.toUpperCase()}
@@ -780,7 +929,9 @@ export function HubApp() {
                 <span className="font-medium">{t("hub.current_variant")}</span>
                 <select
                   value={settings.current_variant}
-                  onChange={(e) => handleSettingPatch({ current_variant: e.target.value }, "hub_change_variant")}
+                  onChange={(e) =>
+                    handleSettingPatch({ current_variant: e.target.value }, "hub_change_variant")
+                  }
                   className="h-9 px-3 rounded-card border border-border bg-bg text-xs font-semibold"
                 >
                   {settings.variant_labels.map((v) => (
@@ -790,6 +941,65 @@ export function HubApp() {
                   ))}
                 </select>
               </div>
+
+              {/* Add new Station 7 variant label */}
+              <form onSubmit={handleAddVariantLabel} className="pt-2 border-t border-border space-y-2">
+                <span className="block text-xs font-semibold text-muted">
+                  Add Station 7 Variant Label
+                </span>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    maxLength={12}
+                    value={newVariantLabel}
+                    onChange={(e) => setNewVariantLabel(e.target.value)}
+                    placeholder="e.g. W2, W3"
+                    className="flex-1 h-10 px-3 rounded-card border border-border bg-bg text-sm"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!newVariantLabel.trim()}
+                    className="h-10 px-3.5 rounded-card bg-accent text-white text-xs font-semibold inline-flex items-center gap-1 disabled:opacity-40"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add</span>
+                  </button>
+                </div>
+              </form>
+
+              {/* Max teams & Walk time */}
+              <form onSubmit={handleSaveNumericSettings} className="pt-2 border-t border-border space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block">
+                    <span className="text-xs font-semibold text-muted">{t("hub.max_teams")}</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={200}
+                      value={maxTeamsInput}
+                      onChange={(e) => setMaxTeamsInput(e.target.value)}
+                      className="mt-1 w-full h-10 px-3 rounded-card border border-border bg-bg tabular-nums"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs font-semibold text-muted">Walk time (s)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={300}
+                      value={walkTimeInput}
+                      onChange={(e) => setWalkTimeInput(e.target.value)}
+                      className="mt-1 w-full h-10 px-3 rounded-card border border-border bg-bg tabular-nums"
+                    />
+                  </label>
+                </div>
+                <button
+                  type="submit"
+                  className="h-10 px-4 rounded-card border border-border bg-bg text-xs font-semibold"
+                >
+                  {t("common.save")}
+                </button>
+              </form>
             </div>
           </div>
         )}
@@ -804,6 +1014,7 @@ export function HubApp() {
         )}
       </div>
 
+      {/* Team Detail Drawer */}
       {drawerTeam && drawerRow && (
         <aside className="fixed inset-y-0 right-0 w-full max-w-sm bg-surface border-l border-border shadow-soft p-5 z-40 overflow-y-auto space-y-4">
           <div className="flex items-center justify-between">
@@ -821,12 +1032,40 @@ export function HubApp() {
               <span>{t("common.close")}</span>
             </button>
           </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void handleToggleDuelWon(drawerTeam)}
+              className={
+                "h-9 px-3 rounded-card border text-xs font-semibold " +
+                (drawerTeam.duel_won
+                  ? "border-accent bg-accent/15 text-accent"
+                  : "border-border text-muted")
+              }
+            >
+              {drawerTeam.duel_won ? "Duel Winner: YES" : "Mark Duel Winner"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setWithdrawTarget(drawerTeam);
+                setWithdrawReason("");
+              }}
+              className="h-9 px-3 rounded-card border border-danger/40 text-danger text-xs font-semibold"
+            >
+              {drawerTeam.withdrawn ? "Reinstate Team" : t("hub.withdraw")}
+            </button>
+          </div>
+
           <div className="divide-y divide-border text-sm">
             {stations.map((st) => {
               const cell = drawerRow.stations[st.id];
               return (
                 <div key={st.id} className="py-2.5 flex items-center justify-between">
-                  <span>S{st.id} · {st.name}</span>
+                  <span>
+                    S{st.id} · {st.name}
+                  </span>
                   <span className="tabular-nums font-medium">
                     {cell?.played ? cell.total_points.toFixed(1) + " pts" : "—"}
                   </span>
@@ -837,23 +1076,110 @@ export function HubApp() {
         </aside>
       )}
 
+      {/* Withdraw / Reinstate Team Modal */}
+      {withdrawTarget && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50"
+        >
+          <form
+            onSubmit={handleConfirmWithdraw}
+            className="w-full max-w-md bg-surface border border-border rounded-card p-5 shadow-soft space-y-4"
+          >
+            <h2 className="text-base font-semibold">
+              {withdrawTarget.withdrawn ? "Reinstate" : t("hub.withdraw")} · Team #
+              {withdrawTarget.number}
+            </h2>
+            <p className="text-sm text-muted">
+              {withdrawTarget.withdrawn
+                ? "Reinstating this team includes them in the leaderboard and Final N."
+                : "Withdrawing this team excludes them from the leaderboard and Final N."}
+            </p>
+            <label className="block text-sm">
+              <span className="text-muted">{t("hub.reason_label")}</span>
+              <input
+                type="text"
+                required
+                value={withdrawReason}
+                onChange={(e) => setWithdrawReason(e.target.value)}
+                placeholder={t("hub.reason_required")}
+                className="mt-1 w-full h-11 px-3 rounded-card border border-border bg-bg"
+              />
+            </label>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setWithdrawTarget(null)}
+                className="h-10 px-4 rounded-card border border-border text-sm font-medium"
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="submit"
+                disabled={!withdrawReason.trim()}
+                className={
+                  "h-10 px-4 rounded-card text-white text-sm font-semibold disabled:opacity-50 " +
+                  (withdrawTarget.withdrawn ? "bg-success" : "bg-danger")
+                }
+              >
+                {t("common.save")}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Edit Attempt Modal (now supports completed & progress) */}
       {editingAttempt && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50"
+        >
           <form
             onSubmit={handleSaveAttemptEdit}
             className="w-full max-w-md bg-surface border border-border rounded-card p-5 shadow-soft space-y-4"
           >
-            <h2 className="text-base font-semibold">{t("common.edit")} · Stn {editingAttempt.station_id}</h2>
-            <div className="space-y-2 text-sm">
+            <h2 className="text-base font-semibold">
+              {t("common.edit")} · Stn {editingAttempt.station_id}
+            </h2>
+            <div className="space-y-3 text-sm">
               <label className="block">
-                <span className="text-muted">Time (ms)</span>
-                <input
-                  type="number"
-                  value={editTimeMs}
-                  onChange={(e) => setEditTimeMs(e.target.value)}
-                  className="mt-1 w-full h-11 px-3 rounded-card border border-border bg-bg tabular-nums"
-                />
+                <span className="text-muted">Outcome</span>
+                <select
+                  value={editCompleted ? "true" : "false"}
+                  onChange={(e) => setEditCompleted(e.target.value === "true")}
+                  className="mt-1 w-full h-11 px-3 rounded-card border border-border bg-bg"
+                >
+                  <option value="true">{t("host.completed")}</option>
+                  <option value="false">{t("host.dnf")}</option>
+                </select>
               </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="text-muted">Time (ms)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={editTimeMs}
+                    onChange={(e) => setEditTimeMs(e.target.value)}
+                    className="mt-1 w-full h-11 px-3 rounded-card border border-border bg-bg tabular-nums"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-muted">Progress / Count</span>
+                  <input
+                    type="number"
+                    step="any"
+                    min={0}
+                    value={editProgress}
+                    onChange={(e) => setEditProgress(e.target.value)}
+                    placeholder="Empty = null"
+                    className="mt-1 w-full h-11 px-3 rounded-card border border-border bg-bg tabular-nums"
+                  />
+                </label>
+              </div>
               <label className="block">
                 <span className="text-muted">Bonus</span>
                 <select
@@ -906,8 +1232,69 @@ export function HubApp() {
         </div>
       )}
 
+      {/* Mobile / Tablet "More" Sheet exposing Attempts, Roles, Settings, Export & Sign out */}
+      {moreMenuOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="lg:hidden fixed inset-0 bg-black/40 flex items-end z-50"
+          onClick={() => setMoreMenuOpen(false)}
+        >
+          <div
+            className="w-full bg-surface border-t border-border rounded-t-card p-4 safe-pb space-y-2"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-2 border-b border-border">
+              <span className="text-sm font-semibold">
+                Hub Menu ({settings?.event_state?.toUpperCase() ?? "PRACTICE"})
+              </span>
+              <button
+                type="button"
+                onClick={() => setMoreMenuOpen(false)}
+                className="h-8 px-2.5 rounded-card border border-border text-xs"
+              >
+                {t("common.close")}
+              </button>
+            </div>
+            {overflowMobileTabs.map((item) => {
+              const Icon = item.icon;
+              const active = tab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    setTab(item.id);
+                    setMoreMenuOpen(false);
+                  }}
+                  className={
+                    "w-full flex items-center gap-3 px-3 py-3 rounded-card text-sm font-medium " +
+                    (active ? "bg-accent text-white" : "bg-bg text-text")
+                  }
+                >
+                  <Icon className="w-4 h-4" />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              onClick={() => {
+                clearSession();
+                router.replace("/login");
+              }}
+              className="w-full flex items-center gap-3 px-3 py-3 rounded-card text-sm font-medium text-danger bg-danger/10"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>{t("common.sign_out")}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Mobile / Tablet bottom tab bar (<1024px) */}
       <nav className="lg:hidden fixed bottom-0 inset-x-0 bg-surface border-t border-border safe-pb flex justify-around px-1 pt-1 z-30">
-        {navItems.slice(0, 5).map((item) => {
+        {primaryMobileTabs.map((item) => {
           const Icon = item.icon;
           const active = tab === item.id;
           return (
@@ -925,6 +1312,17 @@ export function HubApp() {
             </button>
           );
         })}
+        <button
+          type="button"
+          onClick={() => setMoreMenuOpen(true)}
+          className={
+            "flex flex-col items-center gap-0.5 py-1.5 px-2 text-[11px] font-medium " +
+            (isOverflowTabActive || moreMenuOpen ? "text-accent" : "text-muted")
+          }
+        >
+          <Menu className="w-4 h-4" />
+          <span>More</span>
+        </button>
       </nav>
     </div>
   );

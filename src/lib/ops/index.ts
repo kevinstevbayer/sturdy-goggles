@@ -1,4 +1,10 @@
-import { deriveStationState, getExpectedNextStation, getRouteOrder, type ResetLogInput, type StationBoardState } from "@/lib/reset";
+import {
+  deriveStationState,
+  getExpectedNextStation,
+  getRouteOrder,
+  type ResetLogInput,
+  type StationBoardState
+} from "@/lib/reset";
 import type { AttemptRow, StationConfig, TeamRow } from "@/lib/types/domain";
 
 export interface InboundEntry {
@@ -72,7 +78,6 @@ export function computeOpsBoard(params: {
   const activeTeams = teams.filter((tm) => !tm.withdrawn);
   const teamById = new Map(activeTeams.map((tm) => [tm.id, tm]));
 
-  // Map inbound teams per station: based on team's latest scored attempt
   const inboundByStation = new Map<number, InboundEntry[]>();
   for (const st of stations) {
     inboundByStation.set(st.id, []);
@@ -85,9 +90,12 @@ export function computeOpsBoard(params: {
     const activeAtt = teamAtts.find((a) => a.state !== "scored");
     const scoredAtts = teamAtts
       .filter((a) => a.state === "scored")
-      .sort((a, b) => Date.parse(a.ended_at ?? a.scored_at ?? a.arrived_at) - Date.parse(b.ended_at ?? b.scored_at ?? b.arrived_at));
+      .sort(
+        (a, b) =>
+          Date.parse(a.ended_at ?? a.scored_at ?? a.arrived_at) -
+          Date.parse(b.ended_at ?? b.scored_at ?? b.arrived_at)
+      );
 
-    // Alert: missing finish (7 scored attempts and finished_at is null)
     if (scoredAtts.length >= stations.length && stations.length > 0 && team.finished_at === null) {
       alerts.push({
         id: "missing_finish_" + team.id,
@@ -100,11 +108,11 @@ export function computeOpsBoard(params: {
       });
     }
 
-    // Alert: wrong station scan (active attempt is not expected next station on route)
+    const playedIds = scoredAtts.map((a) => a.station_id);
+    const expectedNext = getExpectedNextStation(team.route, playedIds);
+
     if (activeAtt) {
-      const playedIds = scoredAtts.map((a) => a.station_id);
-      const expected = getExpectedNextStation(team.route, playedIds);
-      if (expected !== null && activeAtt.station_id !== expected) {
+      if (expectedNext !== null && activeAtt.station_id !== expectedNext) {
         alerts.push({
           id: "wrong_station_" + activeAtt.id,
           code: "wrong_station_scan",
@@ -112,14 +120,20 @@ export function computeOpsBoard(params: {
           station_id: activeAtt.station_id,
           team_number: team.number,
           label: "Off-route scan",
-          detail: "Team #" + team.number + " at Stn " + activeAtt.station_id + " (expected Stn " + expected + ")"
+          detail:
+            "Team #" +
+            team.number +
+            " at Stn " +
+            activeAtt.station_id +
+            " (expected Stn " +
+            expectedNext +
+            ")"
         });
       }
       continue;
     }
 
-    // No active attempt: check if inbound to next station
-    if (team.finished_at !== null || scoredAtts.length === 0 || scoredAtts.length >= stations.length) {
+    if (team.finished_at !== null || scoredAtts.length === 0 || expectedNext === null) {
       continue;
     }
 
@@ -127,10 +141,8 @@ export function computeOpsBoard(params: {
     const lastEndedMs = Date.parse(lastScored.ended_at ?? lastScored.scored_at ?? lastScored.arrived_at);
     if (Number.isNaN(lastEndedMs)) continue;
 
-    const nextStationId = (lastScored.station_id % 7) + 1;
-    const alreadyPlayedNext = scoredAtts.some((a) => a.station_id === nextStationId);
-    if (alreadyPlayedNext) continue;
-
+    // P1 #8: Use route-based next unplayed station so off-route redirected teams stay tracked
+    const nextStationId = expectedNext;
     const etaMs = lastEndedMs + walkTimeS * 1000;
     const bucket = inboundByStation.get(nextStationId);
     if (bucket) {
@@ -143,7 +155,6 @@ export function computeOpsBoard(params: {
       });
     }
 
-    // Alert: no scan 240s after finishing previous station
     if (nowMs - lastEndedMs > 240_000) {
       alerts.push({
         id: "overdue_" + team.id,
@@ -152,7 +163,14 @@ export function computeOpsBoard(params: {
         station_id: nextStationId,
         team_number: team.number,
         label: "Team overdue",
-        detail: "Team #" + team.number + " >240s since Stn " + lastScored.station_id + " (next Stn " + nextStationId + ")"
+        detail:
+          "Team #" +
+          team.number +
+          " >240s since Stn " +
+          lastScored.station_id +
+          " (next Stn " +
+          nextStationId +
+          ")"
       });
     }
   }
@@ -161,7 +179,6 @@ export function computeOpsBoard(params: {
     list.sort((a, b) => a.eta_ms - b.eta_ms);
   }
 
-  // Build station cards and station-level alerts
   const stationCards: StationBoardCard[] = stations.map((st) => {
     const stAtts = liveAttempts.filter((a) => a.station_id === st.id);
     const activeAtt = stAtts.find((a) => a.state !== "scored") ?? null;
@@ -175,6 +192,7 @@ export function computeOpsBoard(params: {
       .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
     const lastReset = stResets[0] ?? null;
     const lastResetDoneMs = lastReset?.done_at ? Date.parse(lastReset.done_at) : null;
+    const lastResetStartedMs = lastReset?.started_at ? Date.parse(lastReset.started_at) : null;
 
     const state = deriveStationState({
       hasActiveSession: activeStationIds.has(st.id),
@@ -182,6 +200,7 @@ export function computeOpsBoard(params: {
       lastScoredEndedAtMs: lastScoredMs,
       lastResetDoneAtMs: lastResetDoneMs,
       lastResetSkipped: lastReset?.skipped ?? false,
+      lastResetStartedAtMs: lastResetStartedMs,
       targetResetS: st.reset.target_s,
       nowMs
     });
@@ -191,7 +210,6 @@ export function computeOpsBoard(params: {
     let inPlayElapsedS: number | null = null;
     if (activeAtt && activeAtt.started_at) {
       inPlayElapsedS = Math.max(0, Math.floor((nowMs - Date.parse(activeAtt.started_at)) / 1000));
-      // Alert: attempt over cap by 10s
       if (activeAtt.state === "started" && inPlayElapsedS > st.cap_s + 10) {
         const tm = teamById.get(activeAtt.team_id);
         alerts.push({
@@ -210,11 +228,10 @@ export function computeOpsBoard(params: {
     const resetPending =
       lastScoredMs !== null &&
       !(lastResetDoneMs !== null && lastResetDoneMs >= lastScoredMs) &&
-      !(lastReset?.skipped && Date.parse(lastReset.started_at) >= lastScoredMs);
+      !(lastReset?.skipped && lastResetStartedMs !== null && lastResetStartedMs >= lastScoredMs);
 
     if (!activeAtt && lastScoredMs !== null && resetPending) {
       resetElapsedS = Math.max(0, Math.floor((nowMs - lastScoredMs) / 1000));
-      // Alert: reset over target while a team is inbound
       if (resetElapsedS > st.reset.target_s && inbound.length > 0) {
         alerts.push({
           id: "reset_over_" + st.id,
@@ -223,12 +240,20 @@ export function computeOpsBoard(params: {
           station_id: st.id,
           team_number: inbound[0]!.team_number,
           label: "Reset over target",
-          detail: "Stn " + st.id + " resetting " + resetElapsedS + "s/" + st.reset.target_s + "s with Team #" + inbound[0]!.team_number + " inbound"
+          detail:
+            "Stn " +
+            st.id +
+            " resetting " +
+            resetElapsedS +
+            "s/" +
+            st.reset.target_s +
+            "s with Team #" +
+            inbound[0]!.team_number +
+            " inbound"
         });
       }
     }
 
-    // Ready since timestamp (after reset done or target_s)
     let readySinceMs: number | null = null;
     if (state === "ready") {
       if (lastResetDoneMs !== null && lastScoredMs !== null && lastResetDoneMs >= lastScoredMs) {
@@ -249,7 +274,6 @@ export function computeOpsBoard(params: {
       }
     }
 
-    // Safe to launch: station is ready (not resetting, not in-play, not offline) AND no team inbound within ETA
     const hasInboundWithinEta = inbound.some((inb) => inb.eta_ms <= nowMs + walkTimeS * 1000);
     const safeToLaunch = state === "ready" && !resetPending && !hasInboundWithinEta;
 
@@ -272,7 +296,6 @@ export function computeOpsBoard(params: {
 
   const cardByStation = new Map(stationCards.map((c) => [c.station_id, c]));
 
-  // Build route dispatch cards A..G
   const routes: DispatchRouteCard[] = Array.from({ length: 7 }, (_, route) => {
     const firstStationId = getRouteOrder(route)[0]!;
     const card = cardByStation.get(firstStationId);
@@ -291,7 +314,6 @@ export function computeOpsBoard(params: {
     };
   });
 
-  // Suggested next team: lowest team number whose route is safe_to_launch
   const safeWaiting = routes
     .filter((r) => r.safe_to_launch && r.waiting_teams.length > 0)
     .map((r) => r.waiting_teams[0]!)

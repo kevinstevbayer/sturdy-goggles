@@ -1,9 +1,18 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.46.1";
-import { SignJWT } from "https://esm.sh/jose@5.9.6";
+// Supabase Edge Function (Deno): Role Link / PIN / Takeover QR -> 12h Signed JWT
+// Enforces cryptographic Hub JWT verification on all admin actions, single active
+// device per role, takeover blocking during active 'started' attempts, and
+// immediate session revocation.
+
+import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.46.1";
+import { jwtVerify, SignJWT } from "https://esm.sh/jose@5.9.6";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const JWT_SECRET = Deno.env.get("SUPABASE_JWT_SECRET") ?? Deno.env.get("JWT_SECRET")!;
+const JWT_SECRET =
+  Deno.env.get("APP_JWT_SECRET") ??
+  Deno.env.get("SUPABASE_JWT_SECRET") ??
+  Deno.env.get("JWT_SECRET") ??
+  "";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -61,12 +70,57 @@ async function mintRoleJwt(params: {
     .sign(key);
 }
 
+async function verifyHubCaller(
+  req: Request,
+  supabase: SupabaseClient
+): Promise<{ ok: true; sessionId: string } | { ok: false }> {
+  const authHeader = req.headers.get("authorization") ?? "";
+  if (!authHeader.startsWith("Bearer ")) {
+    return { ok: false };
+  }
+
+  const token = authHeader.slice("Bearer ".length).trim();
+  if (!token) {
+    return { ok: false };
+  }
+
+  try {
+    const key = new TextEncoder().encode(JWT_SECRET);
+    const { payload } = await jwtVerify(token, key, { algorithms: ["HS256"] });
+    const appRole = typeof payload.app_role === "string" ? payload.app_role : null;
+    const sessionId = typeof payload.session_id === "string" ? payload.session_id : null;
+
+    if (appRole !== "hub" || !sessionId) {
+      return { ok: false };
+    }
+
+    const { data: activeSession } = await supabase
+      .from("role_sessions")
+      .select("session_id")
+      .eq("session_id", sessionId)
+      .eq("role", "hub")
+      .is("revoked_at", null)
+      .maybeSingle();
+
+    if (!activeSession) {
+      return { ok: false };
+    }
+
+    return { ok: true, sessionId };
+  } catch {
+    return { ok: false };
+  }
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
   if (req.method !== "POST") {
     return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+  }
+  if (!JWT_SECRET) {
+    return jsonResponse({ error: "SERVER_MISCONFIGURED_JWT_SECRET" }, 500);
   }
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
@@ -85,46 +139,57 @@ Deno.serve(async (req: Request) => {
   const ipHash = await sha256Hex(ipRaw);
 
   if (action === "list_roles") {
-    const authHeader = req.headers.get("authorization") ?? "";
-    const callerRole = String(payload.caller_role ?? "");
-    if (!authHeader.startsWith("Bearer ") || callerRole !== "hub") {
+    const hub = await verifyHubCaller(req, supabase);
+    if (!hub.ok) {
       return jsonResponse({ error: "HUB_AUTH_REQUIRED" }, 403);
     }
-    const { data } = await supabase
+
+    const { data, error } = await supabase
       .from("role_credentials")
       .select("role, station_id, secret_token, pin_code")
       .order("role", { ascending: true });
+
+    if (error) {
+      return jsonResponse({ error: "LIST_ROLES_FAILED", detail: error.message }, 500);
+    }
     return jsonResponse({ roles: data ?? [] });
   }
 
   if (action === "create_takeover") {
-    const authHeader = req.headers.get("authorization") ?? "";
-    const callerRole = String(payload.caller_role ?? "");
+    const hub = await verifyHubCaller(req, supabase);
     const targetRole = String(payload.target_role ?? "");
-    if (!authHeader.startsWith("Bearer ") || callerRole !== "hub" || !targetRole) {
+    if (!hub.ok || !targetRole) {
       return jsonResponse({ error: "HUB_AUTH_REQUIRED" }, 403);
     }
+
     const { data: cred } = await supabase
       .from("role_credentials")
       .select("role, station_id")
       .eq("role", targetRole)
       .maybeSingle();
-    if (!cred) return jsonResponse({ error: "ROLE_NOT_FOUND" }, 404);
+
+    if (!cred) {
+      return jsonResponse({ error: "ROLE_NOT_FOUND" }, 404);
+    }
 
     const token = randomSecret(20);
-    await supabase.from("takeover_tokens").insert({
+    const { error: insErr } = await supabase.from("takeover_tokens").insert({
       token,
       role: cred.role,
       station_id: cred.station_id
     });
+
+    if (insErr) {
+      return jsonResponse({ error: "TAKEOVER_CREATE_FAILED", detail: insErr.message }, 500);
+    }
+
     return jsonResponse({ token, role: cred.role });
   }
 
   if (action === "regenerate") {
-    const authHeader = req.headers.get("authorization") ?? "";
-    const callerRole = String(payload.caller_role ?? "");
+    const hub = await verifyHubCaller(req, supabase);
     const targetRole = String(payload.target_role ?? "");
-    if (!authHeader.startsWith("Bearer ") || callerRole !== "hub" || !targetRole) {
+    if (!hub.ok || !targetRole) {
       return jsonResponse({ error: "HUB_AUTH_REQUIRED" }, 403);
     }
 
@@ -133,7 +198,11 @@ Deno.serve(async (req: Request) => {
 
     const { error: updErr } = await supabase
       .from("role_credentials")
-      .update({ secret_token: newSecret, pin_code: newPin, updated_at: new Date().toISOString() })
+      .update({
+        secret_token: newSecret,
+        pin_code: newPin,
+        updated_at: new Date().toISOString()
+      })
       .eq("role", targetRole);
 
     if (updErr) {
@@ -142,7 +211,10 @@ Deno.serve(async (req: Request) => {
 
     await supabase
       .from("role_sessions")
-      .update({ revoked_at: new Date().toISOString(), revoked_reason: "credentials_regenerated" })
+      .update({
+        revoked_at: new Date().toISOString(),
+        revoked_reason: "credentials_regenerated"
+      })
       .eq("role", targetRole)
       .is("revoked_at", null);
 
@@ -151,11 +223,21 @@ Deno.serve(async (req: Request) => {
 
   const secret = typeof payload.secret === "string" ? payload.secret.trim() : null;
   const pin = typeof payload.pin === "string" ? payload.pin.trim() : null;
-  let takeoverToken = typeof payload.takeover_token === "string" ? payload.takeover_token.trim() : null;
+  let takeoverToken =
+    typeof payload.takeover_token === "string" ? payload.takeover_token.trim() : null;
   if (!takeoverToken && secret && secret.startsWith("takeover-")) {
     takeoverToken = secret.slice("takeover-".length);
   }
-  const hubOverride = payload.hub_override === true;
+  const hubOverrideRequested = payload.hub_override === true;
+
+  let hubOverrideAuthorized = false;
+  if (hubOverrideRequested) {
+    const hub = await verifyHubCaller(req, supabase);
+    if (!hub.ok) {
+      return jsonResponse({ error: "HUB_AUTH_REQUIRED" }, 403);
+    }
+    hubOverrideAuthorized = true;
+  }
 
   if (pin !== null) {
     const cutoff = new Date(Date.now() - 60_000).toISOString();
@@ -235,7 +317,7 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  if (hasActiveDevice && matchedRole.station_id !== null && !hubOverride) {
+  if (hasActiveDevice && matchedRole.station_id !== null && !hubOverrideAuthorized) {
     const { count: startedCount } = await supabase
       .from("attempts")
       .select("id", { count: "exact", head: true })

@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run src/lib/scoring src/lib/timer src/lib/reset src/lib/ops",
+    "test": "vitest run src/lib/scoring src/lib/timer src/lib/reset src/lib/ops src/lib/offline",
     "test:integration": "vitest run tests/rls-and-auth.test.ts",
     "test:all": "vitest run",
     "test:e2e": "playwright test"

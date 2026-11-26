@@ -59,8 +59,8 @@ export function computeStationResetStats(
  * Derive live station board state for Hub and Floater:
  * - offline: no active session for this station
  * - in-play: has an active attempt in arrived|started|ended
- * - resetting: last scored attempt ended < target_s ago and no done/skipped reset after it
- * - ready: otherwise (after Reset done OR after target_s elapsed)
+ * - resetting: last scored attempt ended < target_s ago and no done/skipped reset AFTER it
+ * - ready: otherwise (after Reset done/skipped for this attempt OR after target_s elapsed)
  */
 export function deriveStationState(params: {
   hasActiveSession: boolean;
@@ -68,6 +68,7 @@ export function deriveStationState(params: {
   lastScoredEndedAtMs: number | null;
   lastResetDoneAtMs: number | null;
   lastResetSkipped: boolean;
+  lastResetStartedAtMs: number | null;
   targetResetS: number;
   nowMs: number;
 }): StationBoardState {
@@ -75,11 +76,16 @@ export function deriveStationState(params: {
   if (params.hasInPlayAttempt) return "in-play";
   if (params.lastScoredEndedAtMs === null) return "ready";
 
-  const resetFinishedAfterLastAttempt =
-    (params.lastResetDoneAtMs !== null && params.lastResetDoneAtMs >= params.lastScoredEndedAtMs) ||
-    params.lastResetSkipped;
+  const doneAfterLastAttempt =
+    params.lastResetDoneAtMs !== null &&
+    params.lastResetDoneAtMs >= params.lastScoredEndedAtMs;
 
-  if (resetFinishedAfterLastAttempt) return "ready";
+  const skippedAfterLastAttempt =
+    params.lastResetSkipped &&
+    params.lastResetStartedAtMs !== null &&
+    params.lastResetStartedAtMs >= params.lastScoredEndedAtMs;
+
+  if (doneAfterLastAttempt || skippedAfterLastAttempt) return "ready";
 
   const elapsedResetS = (params.nowMs - params.lastScoredEndedAtMs) / 1000;
   if (elapsedResetS < params.targetResetS) {

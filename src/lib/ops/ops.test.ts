@@ -32,7 +32,7 @@ function makeTeam(num: number, overrides: Partial<TeamRow> = {}): TeamRow {
   };
 }
 
-describe("computeOpsBoard (alerts & continuous dispatch)", () => {
+describe("computeOpsBoard (alerts, off-route inbound & continuous dispatch)", () => {
   it("flags attempt_over_cap_10s, team_overdue_240s, wrong_station_scan, and reset_over_target_with_inbound", () => {
     const nowMs = Date.parse("2027-01-10T10:00:00Z");
     const teams = [
@@ -42,7 +42,6 @@ describe("computeOpsBoard (alerts & continuous dispatch)", () => {
     ];
 
     const attempts: AttemptRow[] = [
-      // Team 1 over cap by 20s at Stn 1 (cap 120s -> started 140s ago)
       {
         id: "a1",
         team_id: "t-1",
@@ -63,7 +62,6 @@ describe("computeOpsBoard (alerts & continuous dispatch)", () => {
         version: 1,
         session_id: "s1"
       },
-      // Team 2 finished Stn 2 300s ago -> overdue (>240s) heading to Stn 3
       {
         id: "a2",
         team_id: "t-2",
@@ -84,7 +82,6 @@ describe("computeOpsBoard (alerts & continuous dispatch)", () => {
         version: 1,
         session_id: "s2"
       },
-      // Team 3 (route 2 -> expects Stn 3) scanned at Stn 5 -> wrong_station_scan
       {
         id: "a3",
         team_id: "t-3",
@@ -105,7 +102,6 @@ describe("computeOpsBoard (alerts & continuous dispatch)", () => {
         version: 1,
         session_id: "s5"
       },
-      // Stn 3 had a prior attempt end 90s ago (>60s target) with no reset done -> reset_over_target_with_inbound
       {
         id: "a4",
         team_id: "t-1",
@@ -145,6 +141,69 @@ describe("computeOpsBoard (alerts & continuous dispatch)", () => {
     expect(codes.has("reset_over_target_with_inbound")).toBe(true);
   });
 
+  it("tracks off-route redirected teams as inbound to their next unplayed route station", () => {
+    const nowMs = Date.parse("2027-01-10T10:00:00Z");
+    // Team 1 has route 0 -> order [1, 2, 3, 4, 5, 6, 7].
+    // Played Stn 1, then Floater redirected them to Stn 3 (skipping Stn 2).
+    // Next expected unplayed station must be Stn 2.
+    const teams = [makeTeam(1, { started_at: "2027-01-10T09:50:00Z" })];
+    const attempts: AttemptRow[] = [
+      {
+        id: "a1",
+        team_id: "t-1",
+        station_id: 1,
+        state: "scored",
+        arrived_at: new Date(nowMs - 180_000).toISOString(),
+        started_at: new Date(nowMs - 170_000).toISOString(),
+        ended_at: new Date(nowMs - 120_000).toISOString(),
+        scored_at: new Date(nowMs - 120_000).toISOString(),
+        completed: true,
+        time_ms: 50000,
+        progress: null,
+        counters: {},
+        bonus_correct: null,
+        variant: null,
+        practice: false,
+        voided: false,
+        version: 1,
+        session_id: "s1"
+      },
+      {
+        id: "a2",
+        team_id: "t-1",
+        station_id: 3,
+        state: "scored",
+        arrived_at: new Date(nowMs - 90_000).toISOString(),
+        started_at: new Date(nowMs - 80_000).toISOString(),
+        ended_at: new Date(nowMs - 20_000).toISOString(),
+        scored_at: new Date(nowMs - 20_000).toISOString(),
+        completed: true,
+        time_ms: 60000,
+        progress: null,
+        counters: {},
+        bonus_correct: null,
+        variant: null,
+        practice: false,
+        voided: false,
+        version: 1,
+        session_id: "s3"
+      }
+    ];
+
+    const snap = computeOpsBoard({
+      stations: STATIONS,
+      teams,
+      attempts,
+      resets: [],
+      activeStationIds: new Set([1, 2, 3, 4, 5, 6, 7]),
+      walkTimeS: 30,
+      nowMs
+    });
+
+    const stn2 = snap.stations.find((s) => s.station_id === 2)!;
+    expect(stn2.inbound.map((i) => i.team_number)).toEqual([1]);
+  });
+
   it("suggests the next safe-to-launch team and blocks launch when station is busy", () => {
     const nowMs = Date.parse("2027-01-10T10:00:00Z");
     const teams = [makeTeam(1), makeTeam(2)];
@@ -153,7 +212,7 @@ describe("computeOpsBoard (alerts & continuous dispatch)", () => {
       teams,
       attempts: [],
       resets: [],
-      activeStationIds: new Set([2]), // Only Stn 2 online -> Team 1 (Stn 1) not safe, Team 2 (Stn 2) safe
+      activeStationIds: new Set([2]),
       walkTimeS: 30,
       nowMs
     });

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Copy, QrCode, RefreshCw } from "lucide-react";
+import { AlertTriangle, Copy, QrCode, RefreshCw } from "lucide-react";
 import { t } from "@/lib/i18n";
 import { callAuthSession } from "@/lib/supabase/client";
 import type { RoleSession } from "@/lib/types/domain";
@@ -17,6 +17,8 @@ interface RoleCredRow {
 export function HubRolesTab({ session }: { session: RoleSession }) {
   const [roles, setRoles] = useState<RoleCredRow[]>([]);
   const [takeoverInfo, setTakeoverInfo] = useState<{ role: string; url: string } | null>(null);
+  const [confirmRegenRole, setConfirmRegenRole] = useState<string | null>(null);
+  const [regenBusy, setRegenBusy] = useState(false);
   const [origin, setOrigin] = useState("");
 
   useEffect(() => {
@@ -26,25 +28,32 @@ export function HubRolesTab({ session }: { session: RoleSession }) {
   }, []);
 
   async function loadRoles() {
-    const res = await callAuthSession({ action: "list_roles", caller_role: "hub" }, session.access_token);
+    const res = await callAuthSession({ action: "list_roles" }, session.access_token);
     if (res.ok && Array.isArray(res.data.roles)) {
       setRoles(res.data.roles as RoleCredRow[]);
     }
   }
 
-  async function handleRegenerate(targetRole: string) {
-    const res = await callAuthSession(
-      { action: "regenerate", caller_role: "hub", target_role: targetRole },
-      session.access_token
-    );
-    if (res.ok) {
-      await loadRoles();
+  async function executeRegenerate() {
+    if (!confirmRegenRole) return;
+    setRegenBusy(true);
+    try {
+      const res = await callAuthSession(
+        { action: "regenerate", target_role: confirmRegenRole },
+        session.access_token
+      );
+      if (res.ok) {
+        setConfirmRegenRole(null);
+        await loadRoles();
+      }
+    } finally {
+      setRegenBusy(false);
     }
   }
 
   async function handleCreateTakeover(targetRole: string) {
     const res = await callAuthSession(
-      { action: "create_takeover", caller_role: "hub", target_role: targetRole },
+      { action: "create_takeover", target_role: targetRole },
       session.access_token
     );
     if (res.ok && typeof res.data.token === "string") {
@@ -61,7 +70,7 @@ export function HubRolesTab({ session }: { session: RoleSession }) {
 
       {roles.length === 0 ? (
         <p className="text-sm text-muted bg-surface border border-border rounded-card p-6 text-center">
-          No role credentials loaded. Start auth-session Edge Function and refresh.
+          No role credentials loaded. Ensure auth-session Edge Function is deployed and refresh.
         </p>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -96,7 +105,7 @@ export function HubRolesTab({ session }: { session: RoleSession }) {
                   </button>
                   <button
                     type="button"
-                    onClick={() => void handleRegenerate(rc.role)}
+                    onClick={() => setConfirmRegenRole(rc.role)}
                     className="h-9 px-3 rounded-card border border-danger/40 text-danger text-xs font-medium inline-flex items-center gap-1"
                   >
                     <RefreshCw className="w-3.5 h-3.5" />
@@ -109,8 +118,60 @@ export function HubRolesTab({ session }: { session: RoleSession }) {
         </div>
       )}
 
+      {/* Confirmation dialog before rotating credentials & revoking active sessions */}
+      {confirmRegenRole && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50"
+        >
+          <div className="bg-surface border border-border rounded-card p-5 shadow-soft max-w-sm w-full space-y-4">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-5 h-5 text-danger shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <h2 className="text-base font-semibold">
+                  Regenerate {confirmRegenRole.replace("_", " ").toUpperCase()}?
+                </h2>
+                <p className="text-sm text-muted">
+                  This creates a new PIN and secret link, and immediately signs out the currently
+                  active device for this role.
+                </p>
+                {confirmRegenRole === "hub" && (
+                  <p className="text-xs font-semibold text-danger pt-1">
+                    Warning: Regenerating HUB will sign out this Hub session. Copy the new PIN before
+                    reloading.
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={regenBusy}
+                onClick={() => setConfirmRegenRole(null)}
+                className="h-10 px-4 rounded-card border border-border text-sm font-medium"
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="button"
+                disabled={regenBusy}
+                onClick={() => void executeRegenerate()}
+                className="h-10 px-4 rounded-card bg-danger text-white text-sm font-semibold disabled:opacity-50"
+              >
+                {t("hub.regenerate")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {takeoverInfo && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50"
+        >
           <div className="bg-surface border border-border rounded-card p-5 shadow-soft max-w-xs w-full text-center space-y-3">
             <h2 className="text-base font-semibold uppercase">
               {takeoverInfo.role.replace("_", " ")} · 2 min

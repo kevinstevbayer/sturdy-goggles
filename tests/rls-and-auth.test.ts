@@ -35,7 +35,9 @@ function clientWithJwt(jwt: string): SupabaseClient {
 describe.skipIf(!hasEnv)("Phase 1 RLS, Auth & Practice Guard Integration", () => {
   let admin: SupabaseClient;
   let st1SessionId: string;
+  let st1Jwt: string;
   let st1Client: SupabaseClient;
+  let hubJwt: string;
   let hubClient: SupabaseClient;
   let sampleTeamId: string;
 
@@ -50,14 +52,16 @@ describe.skipIf(!hasEnv)("Phase 1 RLS, Auth & Practice Guard Integration", () =>
       .select("session_id")
       .single();
     st1SessionId = st1Sess!.session_id;
-    st1Client = clientWithJwt(await mintTestJwt("station_1", 1, st1SessionId));
+    st1Jwt = await mintTestJwt("station_1", 1, st1SessionId);
+    st1Client = clientWithJwt(st1Jwt);
 
     const { data: hubSess } = await admin
       .from("role_sessions")
       .insert({ role: "hub", station_id: null })
       .select("session_id")
       .single();
-    hubClient = clientWithJwt(await mintTestJwt("hub", null, hubSess!.session_id));
+    hubJwt = await mintTestJwt("hub", null, hubSess!.session_id);
+    hubClient = clientWithJwt(hubJwt);
 
     const { data: team } = await admin.from("teams").select("id").eq("number", 30).single();
     sampleTeamId = team!.id;
@@ -174,5 +178,93 @@ describe.skipIf(!hasEnv)("Phase 1 RLS, Auth & Practice Guard Integration", () =>
     expect(blockedRes.status).toBe(409);
 
     await admin.from("attempts").delete().eq("id", startedId);
+  });
+
+  it("rejects forged and non-hub Bearer tokens on auth-session admin actions", async () => {
+    const fnUrl = SUPABASE_URL + "/functions/v1/auth-session";
+
+    const forgedList = await fetch(fnUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: ANON_KEY,
+        Authorization: "Bearer forged-token"
+      },
+      body: JSON.stringify({ action: "list_roles", caller_role: "hub" })
+    });
+    expect(forgedList.status).toBe(403);
+
+    const hostRegen = await fetch(fnUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: ANON_KEY,
+        Authorization: "Bearer " + st1Jwt
+      },
+      body: JSON.stringify({ action: "regenerate", target_role: "station_2" })
+    });
+    expect(hostRegen.status).toBe(403);
+
+    const hubList = await fetch(fnUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: ANON_KEY,
+        Authorization: "Bearer " + hubJwt
+      },
+      body: JSON.stringify({ action: "list_roles" })
+    });
+    expect(hubList.status).toBe(200);
+    const listBody = (await hubList.json()) as { roles?: unknown[] };
+    expect(Array.isArray(listBody.roles)).toBe(true);
+    expect((listBody.roles ?? []).length).toBeGreaterThanOrEqual(9);
+  });
+
+  it("finalize rejects non-hub callers and stores a full leaderboard snapshot for Hub", async () => {
+    const finalizeUrl = SUPABASE_URL + "/functions/v1/finalize";
+
+    const forgedRes = await fetch(finalizeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: ANON_KEY,
+        Authorization: "Bearer fake"
+      }
+    });
+    expect(forgedRes.status).toBe(403);
+
+    const hostRes = await fetch(finalizeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: ANON_KEY,
+        Authorization: "Bearer " + st1Jwt
+      }
+    });
+    expect(hostRes.status).toBe(403);
+
+    const hubRes = await fetch(finalizeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: ANON_KEY,
+        Authorization: "Bearer " + hubJwt
+      }
+    });
+    expect(hubRes.status).toBe(200);
+    const body = (await hubRes.json()) as {
+      snapshot?: { id: string; n_final: number; payload?: { leaderboard?: unknown[] } };
+    };
+    expect(body.snapshot?.id).toBeTruthy();
+    expect(Array.isArray(body.snapshot?.payload?.leaderboard)).toBe(true);
+    expect((body.snapshot?.payload?.leaderboard ?? []).length).toBeGreaterThan(0);
+
+    if (body.snapshot?.id) {
+      await admin.from("final_snapshots").delete().eq("id", body.snapshot.id);
+    }
+    await hubClient.rpc("hub_update_event_settings", {
+      p_patch: { scoring_n_mode: "provisional" },
+      p_reason: "integration_test_cleanup"
+    });
   });
 });
