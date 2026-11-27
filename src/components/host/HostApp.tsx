@@ -252,7 +252,33 @@ export function HostApp() {
     setOnline(typeof navigator !== "undefined" ? navigator.onLine : true);
     void syncServerClock().then((off) => setClockOffsetMs(off));
 
+    // Preload QR scanner chunk while online so camera scanning works offline
+    if (typeof navigator !== "undefined" && navigator.onLine) {
+      void import("@zxing/browser").catch(() => undefined);
+    }
+
     const supabase = getSupabaseClient(s);
+
+    // Instant remote sign-out when this session is revoked by Hub or device takeover
+    const sessionChannel = supabase
+      .channel("host-session-" + s.session_id)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "role_sessions",
+          filter: "session_id=eq." + s.session_id
+        },
+        (payload) => {
+          const nextRow = payload.new as { revoked_at?: string | null } | null;
+          if (nextRow?.revoked_at) {
+            clearSession();
+            router.replace("/login");
+          }
+        }
+      )
+      .subscribe();
 
     async function hydrate() {
       const cachedSt = await offlineDb.stations.get(s!.station_id!);
@@ -349,6 +375,7 @@ export function HostApp() {
     }, 5000);
 
     return () => {
+      void supabase.removeChannel(sessionChannel);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
       window.clearInterval(pollId);

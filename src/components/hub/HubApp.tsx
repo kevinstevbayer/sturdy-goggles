@@ -156,20 +156,29 @@ export function HubApp() {
     void loadAll(s);
 
     const supabase = getSupabaseClient(s);
+    let debounceTimer: number | null = null;
+    const scheduleLoad = () => {
+      if (debounceTimer !== null) window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(() => {
+        debounceTimer = null;
+        void loadAll(s);
+      }, 500);
+    };
+
     const channel = supabase
       .channel("hub-live")
-      .on("postgres_changes", { event: "*", schema: "public", table: "attempts" }, () => void loadAll(s))
-      .on("postgres_changes", { event: "*", schema: "public", table: "teams" }, () => void loadAll(s))
-      .on("postgres_changes", { event: "*", schema: "public", table: "station_resets" }, () => void loadAll(s))
-      .on("postgres_changes", { event: "*", schema: "public", table: "event_settings" }, () => void loadAll(s))
+      .on("postgres_changes", { event: "*", schema: "public", table: "attempts" }, scheduleLoad)
+      .on("postgres_changes", { event: "*", schema: "public", table: "teams" }, scheduleLoad)
+      .on("postgres_changes", { event: "*", schema: "public", table: "station_resets" }, scheduleLoad)
+      .on("postgres_changes", { event: "*", schema: "public", table: "event_settings" }, scheduleLoad)
       .subscribe();
 
-    const pollId = window.setInterval(() => {
-      setNowMs(Date.now());
-      void loadAll(s);
-    }, 5000);
+    const clockId = window.setInterval(() => setNowMs(Date.now()), 5000);
+    const pollId = window.setInterval(() => void loadAll(s), 15000);
     return () => {
+      if (debounceTimer !== null) window.clearTimeout(debounceTimer);
       void supabase.removeChannel(channel);
+      window.clearInterval(clockId);
       window.clearInterval(pollId);
     };
   }, [router]);

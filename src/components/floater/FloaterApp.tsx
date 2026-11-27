@@ -55,20 +55,27 @@ export function FloaterApp() {
 
     void load();
 
+    let debounceTimer: number | null = null;
+    const scheduleLoad = () => {
+      if (debounceTimer !== null) window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(() => {
+        debounceTimer = null;
+        void load();
+      }, 500);
+    };
+
     const channel = supabase
       .channel("floater-live")
-      .on("postgres_changes", { event: "*", schema: "public", table: "attempts" }, () => void load())
-      .on("postgres_changes", { event: "*", schema: "public", table: "station_resets" }, () => void load())
-      .on("postgres_changes", { event: "*", schema: "public", table: "teams" }, () => void load())
+      .on("postgres_changes", { event: "*", schema: "public", table: "attempts" }, scheduleLoad)
+      .on("postgres_changes", { event: "*", schema: "public", table: "station_resets" }, scheduleLoad)
+      .on("postgres_changes", { event: "*", schema: "public", table: "teams" }, scheduleLoad)
       .subscribe();
 
-    const pollId = window.setInterval(() => {
-      setNowMs(Date.now());
-      void load();
-    }, 5000);
+    const pollId = window.setInterval(() => void load(), 15000);
     const clockId = window.setInterval(() => setNowMs(Date.now()), 1000);
 
     return () => {
+      if (debounceTimer !== null) window.clearTimeout(debounceTimer);
       void supabase.removeChannel(channel);
       window.clearInterval(pollId);
       window.clearInterval(clockId);

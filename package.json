@@ -8,31 +8,21 @@
     "start": "next start",
     "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run src/lib/scoring src/lib/timer src/lib/reset src/lib/ops src/lib/offline",
+    "test": "vitest run src/lib/scoring src/lib/timer src/lib/reset src/lib/ops src/lib/offline src/lib/export",
     "test:integration": "vitest run tests/rls-and-auth.test.ts",
     "test:all": "vitest run",
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@radix-ui/react-dialog": "^1.1.2",
-    "@radix-ui/react-dropdown-menu": "^2.1.2",
-    "@radix-ui/react-slot": "^1.1.0",
-    "@radix-ui/react-switch": "^1.1.1",
-    "@radix-ui/react-tabs": "^1.1.1",
     "@supabase/supabase-js": "^2.46.1",
-    "@tanstack/react-query": "^5.60.2",
     "@tanstack/react-table": "^8.20.5",
     "@zxing/browser": "^0.1.5",
-    "class-variance-authority": "^0.7.0",
-    "clsx": "^2.1.1",
     "dexie": "^4.0.10",
     "lucide-react": "^0.454.0",
     "next": "^15.0.3",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "tailwind-merge": "^2.5.4",
-    "zod": "^3.23.8"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.48.2",
